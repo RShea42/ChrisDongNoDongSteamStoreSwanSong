@@ -1,0 +1,5 @@
+# Data stays in Supabase; these are far over GitHub's 100 MB file limit
+*.csv
+# Database password
+.streamlit/secrets.toml
+__pycache__/
