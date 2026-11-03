@@ -60,13 +60,24 @@ def hbar(counts: pd.Series, label: str, height: int = 420) -> alt.Chart:
     ).properties(height=height)
 
 
-def histogram(data: pd.DataFrame, field: str, title: str, step: float | None = None,
-              maxbins: int = 50) -> alt.Chart:
-    b = alt.Bin(step=step) if step else alt.Bin(maxbins=maxbins)
-    return alt.Chart(data).mark_bar(color=BLUE, cornerRadiusTopLeft=4, cornerRadiusTopRight=4).encode(
-        x=alt.X(f"{field}:Q", bin=b, title=title),
-        y=alt.Y("count():Q", title="Number of games"),
-        tooltip=[alt.Tooltip(f"{field}:Q", bin=b, title=title), alt.Tooltip("count():Q", title="Games", format=",")],
+def histogram(values: pd.Series, title: str, step: float | None = None, bins: int = 50) -> alt.Chart:
+    """Bin in pandas and send only the bin counts; sending raw rows made 80 MB charts that dropped
+    the browser connection on Modal."""
+    v = values.dropna().astype(float)
+    if v.empty:
+        edges = np.array([0.0, 1.0])
+    elif step:
+        edges = np.arange(np.floor(v.min() / step) * step, v.max() + step * 1.001, step)
+    else:
+        edges = np.histogram_bin_edges(v, bins)
+    counts, edges = np.histogram(v, edges)
+    data = pd.DataFrame({"start": edges[:-1], "end": edges[1:], "Games": counts})
+    return alt.Chart(data).mark_bar(color=BLUE, binSpacing=2, cornerRadiusTopLeft=4, cornerRadiusTopRight=4).encode(
+        x=alt.X("start:Q", bin="binned", title=title),
+        x2="end:Q",
+        y=alt.Y("Games:Q", title="Number of games"),
+        tooltip=[alt.Tooltip("start:Q", title="From", format=",.2~f"), alt.Tooltip("end:Q", title="To", format=",.2~f"),
+                 alt.Tooltip("Games:Q", format=",")],
     ).properties(height=320)
 
 
@@ -134,14 +145,13 @@ with reviews:
     left, right = st.columns(2)
     with left:
         st.markdown("**Distribution of review counts** (log scale)")
-        logs = pd.DataFrame({"log(1 + total reviews)": np.log1p(f.total_reviews)})
-        st.altair_chart(histogram(logs, "log(1 + total reviews)", "log(1 + total reviews)"),
+        st.altair_chart(histogram(np.log1p(f.total_reviews.astype(float)), "log(1 + total reviews)"),
                         width="stretch")
     with right:
         floor = st.slider("Only games with at least this many reviews", 1, 1000, 50, key="pct_floor")
         st.markdown(f"**Positive review %** (games with {floor:,}+ reviews)")
         pos = f.loc[f.total_reviews >= floor, ["positive_review_pct"]].dropna()
-        st.altair_chart(histogram(pos, "positive_review_pct", "Positive review %", step=5),
+        st.altair_chart(histogram(pos.positive_review_pct, "Positive review %", step=5),
                         width="stretch")
         st.caption(f"{len(pos):,} games · median {pos.positive_review_pct.median():.0f}% positive")
 
@@ -158,8 +168,8 @@ with genres_tags:
     st.subheader("Genres vs. tags per game")
     st.caption("Games usually list 1-3 genres but many tags, so tags carry more detail for similarity.")
     left, right = st.columns(2)
-    left.altair_chart(histogram(f, "genre_count", "Genres per game", step=1), width="stretch")
-    right.altair_chart(histogram(f, "tag_count", "Tags per game", step=1), width="stretch")
+    left.altair_chart(histogram(f.genre_count, "Genres per game", step=1), width="stretch")
+    right.altair_chart(histogram(f.tag_count, "Tags per game", step=1), width="stretch")
 
     st.subheader("Most common pairings")
     left, right = st.columns(2)
