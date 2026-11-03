@@ -1,7 +1,9 @@
 """Steam Games EDA dashboard over the games_cleaned table in Supabase.
 
-Run: streamlit run app.py   (SUPABASE_DB_URL in .streamlit/secrets.toml)
+Run: streamlit run app.py   (SUPABASE_DB_URL in .streamlit/secrets.toml or the environment)
+Deploy: modal deploy modal_app.py
 """
+import os
 from collections import Counter
 from itertools import combinations
 
@@ -29,7 +31,9 @@ CORR_COLUMNS = {
 
 @st.cache_data(ttl="1h", show_spinner="Loading games from Supabase...")
 def load() -> pd.DataFrame:
-    with psycopg2.connect(st.secrets["SUPABASE_DB_URL"]) as conn, conn.cursor() as cur:
+    # Modal passes the URL as an environment variable; locally it comes from .streamlit/secrets.toml
+    url = os.environ.get("SUPABASE_DB_URL") or st.secrets["SUPABASE_DB_URL"]
+    with psycopg2.connect(url) as conn, conn.cursor() as cur:
         cur.execute(f"select {COLUMNS} from public.games_cleaned")
         return pd.DataFrame(cur.fetchall(), columns=[d[0] for d in cur.description])
 
