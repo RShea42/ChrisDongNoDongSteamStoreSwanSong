@@ -3,3 +3,7 @@
 # Database password
 .streamlit/secrets.toml
 __pycache__/
+# Rebuilt from the catalog by features.py
+artifacts/
+# Players' Steam libraries cached by recommend.py / litmus.py (personal data)
+libraries/
