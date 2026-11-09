@@ -7,8 +7,14 @@ session's memory.
 """
 from __future__ import annotations
 
+import functools
 import html
+import html as htmllib
+import json
+import re
 import urllib.error
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 
 import pandas as pd
@@ -39,6 +45,7 @@ CSS = """
 .card h2 a { color: inherit; text-decoration: none; }
 .card h2 a:hover { text-decoration: underline; }
 .card a.store { display: inline-block; margin-top: 8px; font-size: .85rem; }
+.card p.blurb { font-size: 1.02rem !important; line-height: 1.45; margin: 0 0 12px; }
 .card .why { font-size: .95rem; margin-top: 10px; }
 .chip { display: inline-block; background: var(--chip); border-radius: 999px; padding: 2px 10px;
         margin: 0 6px 6px 0; font-size: .8rem; }
@@ -95,6 +102,39 @@ def fetch_library(profile: str) -> dict[int, int]:
     return owned_games(profile)
 
 
+@functools.lru_cache(maxsize=5000)     # server memory only; failures raise, so they aren't cached
+def _fetch_blurb(appid: int) -> str:
+    url = f"https://store.steampowered.com/api/appdetails?appids={appid}&l=english&cc=us&filters=basic"
+    req = urllib.request.Request(url, headers={"User-Agent": "steam-recommender-class-project"})
+    with urllib.request.urlopen(req, timeout=8) as resp:
+        data = json.load(resp)[str(appid)]
+    text = data.get("data", {}).get("short_description", "") if data.get("success") else ""
+    text = " ".join(re.sub(r"<[^>]+>", " ", htmllib.unescape(text)).split())
+    # Keep it a quick read: whole sentences up to ~220 characters (always at least the first, and
+    # a second if the first is under 80 characters and says little); if that runs very long, cut
+    # at a word and add an ellipsis.
+    sentences, kept = re.split(r"(?<=[.!?])\s+", text), ""
+    for s in sentences:
+        if kept and len(kept) >= 80 and len(kept) + len(s) > 220:
+            break
+        kept = f"{kept} {s}".strip()
+    if len(kept) > 300:
+        kept = kept[:300].rsplit(" ", 1)[0].rstrip(",;:") + "…"
+    return kept
+
+
+def store_blurbs(appids) -> dict[int, str]:
+    """Steam's own one-or-two-sentence store description for each game, fetched in parallel.
+    A game whose fetch fails just gets no blurb."""
+    def one(appid):
+        try:
+            return appid, _fetch_blurb(int(appid))
+        except Exception:
+            return appid, ""
+    with ThreadPoolExecutor(max_workers=5) as pool:
+        return dict(pool.map(one, appids))
+
+
 def details(appid: int) -> pd.Series:
     f = features()
     return f.games.iloc[f.row_of[appid]]
@@ -111,12 +151,12 @@ def join_names(names) -> str:
     return names[0] if len(names) == 1 else ", ".join(names[:-1]) + f"{',' if len(names) > 2 else ''} and {names[-1]}"
 
 
-def shared_tags(appid: int, aligned: tuple[str, ...], limit: int = 4) -> list[str]:
-    """Tags of the pick that its aligned library games also carry, most widely shared first."""
+def shared_tags(appid: int, aligned_appids: tuple[int, ...], limit: int = 4) -> list[str]:
+    """Tags of the pick that its aligned library games also carry, most widely shared first.
+    (A collapsed franchise is represented by its most-played game.)"""
     f = features()
     pick = details(appid).tag_list.split(",")[:12]
-    others = [set(f.games.tag_list[f.games.name == n].iat[0].split(",")[:12])
-              for n in aligned if (f.games.name == n).any()]
+    others = [set(details(a).tag_list.split(",")[:12]) for a in aligned_appids if a in f.row_of]
     counts = {t: sum(t in o for o in others) for t in pick}
     return [t for t in sorted(pick, key=lambda t: -counts[t]) if counts[t]][:limit]
 
@@ -127,7 +167,7 @@ def why_html(x: pd.Series, reactions: dict[int, bool] | None = None,
     parts = []
     if x.aligned_with:
         parts.append(f"This game aligns well with {join_names(x.aligned_with)}.")
-        tags = shared_tags(int(x.appid), x.aligned_with)
+        tags = shared_tags(int(x.appid), x.aligned_appids)
         if tags:
             parts.append(f"In common: {html.escape(', '.join(tags))}.")
     if x.because in swiped_names and not (reactions or {}).get(int(x.appid)):
@@ -140,7 +180,7 @@ def why_html(x: pd.Series, reactions: dict[int, bool] | None = None,
 
 def reset():
     for k in ("stage", "pool", "deck", "card", "reactions", "final", "error", "hidden",
-              "hidden_groups"):
+              "hidden_groups", "blurbs"):
         st.session_state.pop(k, None)
 
 
@@ -183,7 +223,8 @@ def start(profile: str, cfg: RecConfig, hide_top: int = 0, hide_recent: int = 0)
         st.session_state.error = "The app isn't configured with a Steam API key."
         return
     st.session_state.update(stage="deck", library=library, pool=pool, deck=deck, card=0,
-                            reactions={}, cfg=cfg, hidden=hidden, hidden_groups=groups)
+                            reactions={}, cfg=cfg, hidden=hidden, hidden_groups=groups,
+                            blurbs=store_blurbs(deck.appid.tolist()))
 
 
 def react(card: int, interested: bool):
@@ -280,6 +321,7 @@ elif stage == "deck":
         <div class="body">
           <h2><a href="{STORE.format(int(card.appid))}" target="_blank">{html.escape(g['name'])}</a></h2>
           <div class="meta">{html.escape(meta_line(g))}</div>
+          {f'<p class="blurb">{html.escape(blurb)}</p>' if (blurb := state.blurbs.get(int(card.appid))) else ''}
           {chips}
           <div><a class="store" href="{STORE.format(int(card.appid))}" target="_blank">View on Steam ↗</a></div>
         </div>

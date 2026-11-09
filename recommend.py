@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import re
 import sys
 import time
 from dataclasses import dataclass
@@ -30,7 +32,11 @@ LIBRARIES = HERE / "libraries"
 class RecConfig:
     n: int = 15
     # Taste profile
-    liked_count: int = 15            # most-played games that define what the user likes
+    liked_count: int = 15            # most-played games (or franchises) that define what the user likes
+    # Several games of one franchise = one taste entry with combined playtime. OFF for now (idea for
+    # later): it broadened the profile (12 -> 15 franchises on a real library) but cost blind-test
+    # hits on recently played games, 1/1/3 -> 0/0/0 @10/15/50 (tune.py, 2026-11-09).
+    collapse_franchises: bool = False
     disliked_count: int = 10         # least-played (but launched) games
     min_disliked_minutes: int = 5    # launched for less than this = probably a crash or a misclick
     max_disliked_minutes: int = 120  # played more than this = not really a dislike, even at the bottom
@@ -95,6 +101,29 @@ def recency_factor(last_played: np.ndarray, cfg: RecConfig, now: float | None = 
     return cfg.recency_floor + (1 - cfg.recency_floor) * decay
 
 
+def series_label(names: list[str]) -> str:
+    """'Fallout 4', 'Fallout: New Vegas' -> 'the Fallout series'; a lone game keeps its name."""
+    if len(names) == 1:
+        return names[0]
+    prefix = os.path.commonprefix([n.replace("’", "'") for n in names])   # Civ titles mix ' and ’
+    prefix = re.sub(r"[\s:\-–—]+$", "", prefix)           # 'Fallout ' / 'Borderlands:' -> clean
+    prefix = re.sub(r"\s+([IVX]+|\d+)$", "", prefix)       # 'Civilization® V' (V / VI) -> 'Civilization®'
+    return f"the {prefix} series" if len(prefix) >= 3 else f"the {names[0]} series"
+
+
+def collapse_by_family(played: pd.DataFrame) -> pd.DataFrame:
+    """One taste entry per franchise/family: playtime and recency-weighted measure are summed, so a
+    devoted fan's franchise still counts strongly but takes one slot instead of three. The
+    franchise's most-played game stands in for its tag profile."""
+    played = played.sort_values("measure", ascending=False)
+    out = played.groupby("family", sort=False).agg(
+        appid=("appid", "first"), row=("row", "first"), name=("name", "first"),
+        minutes=("minutes", "sum"), minutes_2weeks=("minutes_2weeks", "sum"),
+        last_played=("last_played", "max"), measure=("measure", "sum"), members=("name", list))
+    out["label"] = out.members.apply(series_label)
+    return out.reset_index()
+
+
 def taste(f: Features, library: dict[int, dict], cfg: RecConfig) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Pick the liked and disliked games from a library."""
     library = normalize_library(library)
@@ -118,8 +147,14 @@ def taste(f: Features, library: dict[int, dict], cfg: RecConfig) -> tuple[pd.Dat
     played["measure"] = (played.measure * recency_factor(played.last_played.to_numpy(), cfg)
                          + cfg.recent_2weeks_boost * played.minutes_2weeks)
 
-    liked = played.nlargest(cfg.liked_count, "measure")
-    rest = played.drop(liked.index)
+    played["family"] = f.games.family_id.iloc[played.row].to_numpy()
+    if cfg.collapse_franchises:
+        liked = collapse_by_family(played).nlargest(cfg.liked_count, "measure")
+        # A barely-played game from a franchise the player loves isn't a dislike of the franchise.
+        rest = played[~played.family.isin(liked.family)]
+    else:
+        liked = played.nlargest(cfg.liked_count, "measure").assign(label=lambda d: d.name)
+        rest = played.drop(liked.index)
     rest = rest[rest.minutes.between(cfg.min_disliked_minutes, cfg.max_disliked_minutes)]
     rest = rest[rest.minutes_2weeks == 0]           # still being tried out: not a dislike (yet)
     disliked = rest.nsmallest(cfg.disliked_count, "measure")
@@ -147,23 +182,23 @@ def similarity(f: Features, rows: np.ndarray, ref: pd.DataFrame, cfg: RecConfig)
     return np.sort(Sw, axis=1)[:, -k:].mean(axis=1), S, Sw
 
 
-def explain(S: np.ndarray, Sw: np.ndarray, ref: pd.DataFrame, cfg: RecConfig) -> list[tuple[str, ...]]:
-    """For each candidate, up to cfg.explain_max games from the player's own library that drive
+def explain(S: np.ndarray, Sw: np.ndarray, ref: pd.DataFrame, cfg: RecConfig):
+    """For each candidate, up to cfg.explain_max entries from the player's own library that drive
     its score most (by play-weighted similarity), keeping only close matches: raw similarity at
-    least cfg.explain_min_ratio of the best match's. Games liked via a first-look swipe are left
-    out; the app mentions those separately."""
+    least cfg.explain_min_ratio of the best match's. An entry is a game, or a whole franchise
+    ('the Fallout series') when franchises are collapsed. Games liked via a first-look swipe are
+    left out; the app mentions those separately.
+    Returns (labels, appids): display labels, and the appid standing in for each (for tags)."""
     from_library = (ref.source == "library").to_numpy()
-    names = ref.name.to_numpy()
+    labels, appids = ref.label.to_numpy(), ref.appid.to_numpy()
     order = np.argsort(-np.where(from_library, Sw, -np.inf), axis=1)[:, :cfg.explain_max]
-    out = []
+    out_labels, out_ids = [], []
     for i, idx in enumerate(order):
         idx = idx[from_library[idx]]
-        if len(idx) == 0:
-            out.append(())
-            continue
-        floor = cfg.explain_min_ratio * S[i, idx].max()
-        out.append(tuple(names[j] for j in idx if S[i, j] >= floor))
-    return out
+        keep = [j for j in idx if S[i, j] >= cfg.explain_min_ratio * S[i, idx].max()] if len(idx) else []
+        out_labels.append(tuple(labels[j] for j in keep))
+        out_ids.append(tuple(int(appids[j]) for j in keep))
+    return out_labels, out_ids
 
 
 def exclusion_reasons(f: Features, owned: set[int], cfg: RecConfig) -> pd.Series:
@@ -204,7 +239,7 @@ def add_reactions(f: Features, liked: pd.DataFrame, disliked: pd.DataFrame,
         r = f.rows(appids)
         return pd.DataFrame({"appid": f.games.appid.iloc[r].to_numpy(), "row": r,
                              "name": f.games.name.iloc[r].to_numpy(), "weight": weight,
-                             "source": "swipe"})
+                             "source": "swipe", "label": f.games.name.iloc[r].to_numpy()})
     liked = pd.concat([liked, rows_for(interested, liked.weight.median())], ignore_index=True)
     strong = liked.weight.max()
     disliked = pd.concat([disliked, rows_for(not_interested, strong)], ignore_index=True)
@@ -224,6 +259,7 @@ def score_candidates(f: Features, library: dict[int, int], cfg: RecConfig,
     like, S, Sw = similarity(f, rows, liked, cfg)
     dislike, _, _ = similarity(f, rows, disliked, cfg)
     g = f.games.iloc[rows]
+    aligned_labels, aligned_ids = explain(S, Sw, liked, cfg)
     out = pd.DataFrame({
         "appid": g.appid.to_numpy(), "name": g.name.to_numpy(),
         "like": like, "dislike": dislike, "review_score": g.review_score.to_numpy(),
@@ -232,7 +268,8 @@ def score_candidates(f: Features, library: dict[int, int], cfg: RecConfig,
         # similarity here tested better than play-weighted; the display uses aligned_with.)
         "because": liked.name.to_numpy()[S.argmax(axis=1)],
         # Up to 3 games from the player's library that justify the pick (for display).
-        "aligned_with": explain(S, Sw, liked, cfg),
+        "aligned_with": aligned_labels,
+        "aligned_appids": aligned_ids,
     })
     volume = g.log_reviews.to_numpy() / max(g.log_reviews.max(), 1)
     out["quality"] = 0.5 * out.review_score + 0.5 * volume

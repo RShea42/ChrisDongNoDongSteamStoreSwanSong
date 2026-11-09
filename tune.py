@@ -21,6 +21,7 @@ from recommend import RecConfig, get_library, recommend
 
 # Settings to sweep: name -> values to try (the default is marked in the output).
 SWEEPS = {
+    "collapse_franchises": [True, False],
     "recency_half_life_days": [0, 91, 182, 365, 730],
     "quality_weight": [0.0, 0.1, 0.2, 0.3, 0.4, 0.5],
     "dislike_weight": [0.0, 0.25, 0.5, 1.0],
