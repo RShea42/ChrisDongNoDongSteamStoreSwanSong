@@ -20,6 +20,9 @@ from recommend import RecConfig, first_look, refine
 st.set_page_config(page_title="Steam Game Finder", page_icon="🎮", layout="centered")
 
 STORE = "https://store.steampowered.com/app/{}"
+# Never put "<" inside this block, even in a CSS comment: Streamlit's HTML sanitiser then drops
+# the whole <style> element and every custom style disappears. (Paragraph sizes below need
+# !important because Streamlit sets its own size on paragraphs.)
 CSS = """
 <style>
 :root { --card-bg: #f4f6f9; --card-border: #d9dee6; --muted: #5b6573; --chip: #e3e8ef; }
@@ -42,6 +45,14 @@ CSS = """
 .row .rank { font-size: 1.2rem; font-weight: 600; width: 2ch; text-align: right; flex-shrink: 0; }
 .row a { font-weight: 600; font-size: 1.05rem; }
 .row .meta { color: var(--muted); font-size: .85rem; }
+details.why { margin-top: 6px; line-height: 1.4; }
+details.why summary { font-size: .78rem !important; }
+details.why p, details.why p b { font-size: .68rem !important; }
+details.why summary { cursor: pointer; color: var(--muted); list-style: none; user-select: none; }
+details.why summary::-webkit-details-marker { display: none; }
+details.why summary::before { content: "▸"; display: inline-block; width: 1.1em; }
+details.why[open] summary::before { content: "▾"; }
+details.why p { margin: 6px 0 0 1.1em; }
 </style>
 """
 
@@ -90,6 +101,38 @@ def meta_line(g: pd.Series) -> str:
     price = "Free" if g.price == 0 else f"${g.price:.2f}"
     reviews = f"{g.positive_review_pct:.0f}% positive of {int(g.total_reviews):,} reviews"
     return f"{price} · {reviews} · {int(g.release_year)}"
+
+
+def join_names(names) -> str:
+    names = [f"<b>{html.escape(n)}</b>" for n in names]
+    return names[0] if len(names) == 1 else ", ".join(names[:-1]) + f"{',' if len(names) > 2 else ''} and {names[-1]}"
+
+
+def shared_tags(appid: int, aligned: tuple[str, ...], limit: int = 4) -> list[str]:
+    """Tags of the pick that its aligned library games also carry, most widely shared first."""
+    f = features()
+    pick = details(appid).tag_list.split(",")[:12]
+    others = [set(f.games.tag_list[f.games.name == n].iat[0].split(",")[:12])
+              for n in aligned if (f.games.name == n).any()]
+    counts = {t: sum(t in o for o in others) for t in pick}
+    return [t for t in sorted(pick, key=lambda t: -counts[t]) if counts[t]][:limit]
+
+
+def why_html(x: pd.Series, reactions: dict[int, bool] | None = None,
+             swiped_names: set[str] = frozenset()) -> str:
+    """The collapsible 'Why we picked this' explanation for one recommended game."""
+    parts = []
+    if x.aligned_with:
+        parts.append(f"This game aligns well with {join_names(x.aligned_with)}.")
+        tags = shared_tags(int(x.appid), x.aligned_with)
+        if tags:
+            parts.append(f"In common: {html.escape(', '.join(tags))}.")
+    if x.because in swiped_names and not (reactions or {}).get(int(x.appid)):
+        parts.append(f"It's also close to <b>{html.escape(x.because)}</b>, which you were "
+                     "interested in.")
+    if not parts:
+        parts.append("This pick comes from your first-look reactions.")
+    return f'<details class="why"><summary>Why we picked this</summary><p>{" ".join(parts)}</p></details>'
 
 
 def reset():
@@ -235,7 +278,6 @@ elif stage == "deck":
           <h2>{html.escape(g['name'])}</h2>
           <div class="meta">{html.escape(meta_line(g))}</div>
           {chips}
-          <div class="why">Because you played <b>{html.escape(card.because)}</b></div>
         </div>
       </div>""")
     up, down = st.columns(2)
@@ -271,11 +313,9 @@ elif stage == "results":
                         if len(names) < len(ids) else "")
                 st.markdown(f"**{group.capitalize()}:** {', '.join(names)}{note}")
     rows = []
+    swiped_up = {n for a, n in zip(state.deck.appid, state.deck.name) if state.reactions.get(int(a))}
     for _, x in state.final.iterrows():
         g = details(int(x.appid))
-        why = ("you were interested in it" if state.reactions.get(int(x.appid))
-               else f"you played {x.because}" if x.because not in set(state.deck.name)
-               else f"you were interested in {x.because}")
         rows.append(f"""
           <div class="row">
             <div class="rank">{x['rank']}</div>
@@ -283,7 +323,7 @@ elif stage == "results":
             <div>
               <a href="{STORE.format(int(x.appid))}" target="_blank">{html.escape(g['name'])}</a>
               <div class="meta">{html.escape(meta_line(g))}</div>
-              <div class="meta">Because {html.escape(why)}</div>
+              {why_html(x, state.reactions, swiped_up)}
               {'<div class="meta">🎯 <b>One of your hidden favourites (or its series)</b></div>'
                if x.family_id in hidden_families else ''}
             </div>

@@ -50,6 +50,9 @@ class RecConfig:
     # Variety: picks take turns between the liked games they resemble, this many per liked game per
     # round, so one dense genre (e.g. deckbuilders) can't fill the whole list.
     max_per_anchor: int = 2
+    # Explanations ("why we picked this")
+    explain_max: int = 3             # library games named per pick
+    explain_min_ratio: float = 0.6   # only name games at least this close, relative to the closest
     # Filters
     min_reviews: int = 50
     allow_adult: bool = False
@@ -59,7 +62,9 @@ class RecConfig:
     # First look (see first_look / refine)
     pool_size: int = 40              # games generated before the swipe step; the final list comes from these
     deck_size: int = 5               # cards shown
-    deck_relevance: float = 0.6      # 1 = just the best matches, 0 = just the most different
+    # 1 = just the best matches, 0 = just the most different. 0.6 let one near-duplicate pair
+    # through (e.g. two multiplayer FPS); 0.4 keeps cards distinct while staying in the top ~30.
+    deck_relevance: float = 0.4
     deck_recognisability: float = 0.3  # share of a card's value from review volume (well-known games)
 
 
@@ -119,24 +124,46 @@ def taste(f: Features, library: dict[int, dict], cfg: RecConfig) -> tuple[pd.Dat
     rest = rest[rest.minutes_2weeks == 0]           # still being tried out: not a dislike (yet)
     disliked = rest.nsmallest(cfg.disliked_count, "measure")
     liked["weight"] = np.log1p(liked.measure / 60) + 0.1      # recency-adjusted
+    liked["source"] = "library"
     disliked["weight"] = np.log1p(disliked.minutes / 60) + 0.1
     return liked, disliked
 
 
 def similarity(f: Features, rows: np.ndarray, ref: pd.DataFrame, cfg: RecConfig):
-    """Similarity of each candidate row to a set of reference games. Returns (score, best match)."""
+    """Similarity of each candidate row to a set of reference games.
+    Returns (score, S, Sw): the score, raw similarities and play-weighted similarities
+    (candidates x reference games)."""
     if ref.empty:
-        return np.zeros(len(rows)), np.full(len(rows), -1)
+        z = np.zeros((len(rows), 0))
+        return np.zeros(len(rows)), z, z
     S = (f.X[rows] @ f.X[ref.row.to_numpy()].T).toarray()          # candidates x reference games
     w = ref.weight.to_numpy() / ref.weight.max()
-    best = S.argmax(axis=1)
+    Sw = S * w
     if cfg.method == "centroid":
         profile = (f.X[ref.row.to_numpy()].T @ w).ravel()
         profile /= np.linalg.norm(profile) or 1
-        return np.asarray(f.X[rows] @ profile).ravel(), best
-    Sw = S * w
+        return np.asarray(f.X[rows] @ profile).ravel(), S, Sw
     k = min(cfg.knn_k, Sw.shape[1])
-    return np.sort(Sw, axis=1)[:, -k:].mean(axis=1), best
+    return np.sort(Sw, axis=1)[:, -k:].mean(axis=1), S, Sw
+
+
+def explain(S: np.ndarray, Sw: np.ndarray, ref: pd.DataFrame, cfg: RecConfig) -> list[tuple[str, ...]]:
+    """For each candidate, up to cfg.explain_max games from the player's own library that drive
+    its score most (by play-weighted similarity), keeping only close matches: raw similarity at
+    least cfg.explain_min_ratio of the best match's. Games liked via a first-look swipe are left
+    out; the app mentions those separately."""
+    from_library = (ref.source == "library").to_numpy()
+    names = ref.name.to_numpy()
+    order = np.argsort(-np.where(from_library, Sw, -np.inf), axis=1)[:, :cfg.explain_max]
+    out = []
+    for i, idx in enumerate(order):
+        idx = idx[from_library[idx]]
+        if len(idx) == 0:
+            out.append(())
+            continue
+        floor = cfg.explain_min_ratio * S[i, idx].max()
+        out.append(tuple(names[j] for j in idx if S[i, j] >= floor))
+    return out
 
 
 def exclusion_reasons(f: Features, owned: set[int], cfg: RecConfig) -> pd.Series:
@@ -176,7 +203,8 @@ def add_reactions(f: Features, liked: pd.DataFrame, disliked: pd.DataFrame,
     def rows_for(appids, weight):
         r = f.rows(appids)
         return pd.DataFrame({"appid": f.games.appid.iloc[r].to_numpy(), "row": r,
-                             "name": f.games.name.iloc[r].to_numpy(), "weight": weight})
+                             "name": f.games.name.iloc[r].to_numpy(), "weight": weight,
+                             "source": "swipe"})
     liked = pd.concat([liked, rows_for(interested, liked.weight.median())], ignore_index=True)
     strong = liked.weight.max()
     disliked = pd.concat([disliked, rows_for(not_interested, strong)], ignore_index=True)
@@ -193,14 +221,18 @@ def score_candidates(f: Features, library: dict[int, int], cfg: RecConfig,
     reasons = exclusion_reasons(f, set(library) | set(not_interested), cfg)
     rows = np.flatnonzero(reasons.eq("").to_numpy())
 
-    like, best = similarity(f, rows, liked, cfg)
-    dislike, _ = similarity(f, rows, disliked, cfg)
+    like, S, Sw = similarity(f, rows, liked, cfg)
+    dislike, _, _ = similarity(f, rows, disliked, cfg)
     g = f.games.iloc[rows]
     out = pd.DataFrame({
         "appid": g.appid.to_numpy(), "name": g.name.to_numpy(),
         "like": like, "dislike": dislike, "review_score": g.review_score.to_numpy(),
         "total_reviews": g.total_reviews.to_numpy(), "family_id": g.family_id.to_numpy(),
-        "because": liked.name.to_numpy()[best],
+        # The closest liked game (library or swipe); drives the variety round-robin. (Raw
+        # similarity here tested better than play-weighted; the display uses aligned_with.)
+        "because": liked.name.to_numpy()[S.argmax(axis=1)],
+        # Up to 3 games from the player's library that justify the pick (for display).
+        "aligned_with": explain(S, Sw, liked, cfg),
     })
     volume = g.log_reviews.to_numpy() / max(g.log_reviews.max(), 1)
     out["quality"] = 0.5 * out.review_score + 0.5 * volume
