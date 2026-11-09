@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -34,13 +35,18 @@ class RecConfig:
     min_disliked_minutes: int = 5    # launched for less than this = probably a crash or a misclick
     max_disliked_minutes: int = 120  # played more than this = not really a dislike, even at the bottom
     playtime_measure: str = "raw"    # "raw" minutes, or "relative" to the game's median playtime
+    # Recency (Steam gives a last-played date and two-week playtime per game, nothing longer)
+    recency_half_life_days: float = 180   # a game's playtime counts half after this long; 0 = off
+    recency_floor: float = 0.25           # ...but never less than this share
+    recent_2weeks_boost: float = 10.0     # each minute in the last two weeks counts this many times
     # Scoring
     method: str = "knn"              # "knn": match any one liked game; "centroid": match the average
     knn_k: int = 3                   # knn: average of the k best matches among liked games
     dislike_weight: float = 0.5
     # Share of the score from quality = half review score, half review volume (log scale). Proven
-    # games are a safer bet than near-identical obscure clones with the same tags.
-    quality_weight: float = 0.3
+    # games are a safer bet than near-identical obscure clones with the same tags. 0.5 nearly
+    # doubled blind-test hits over 0.3 (tune.py, 2026-11-09); above ~0.6 lists turn generic.
+    quality_weight: float = 0.5
     # Variety: picks take turns between the liked games they resemble, this many per liked game per
     # round, so one dense genre (e.g. deckbuilders) can't fill the whole list.
     max_per_anchor: int = 2
@@ -50,11 +56,45 @@ class RecConfig:
     allow_sequels_of_owned: bool = True   # own Hades -> Hades II may be recommended
     max_franchise_picks: int = 3          # ...but at most this many from series the user owns
     max_per_family: int = 1               # editions/sequels of one game in the final list
+    # First look (see first_look / refine)
+    pool_size: int = 40              # games generated before the swipe step; the final list comes from these
+    deck_size: int = 5               # cards shown
+    deck_relevance: float = 0.6      # 1 = just the best matches, 0 = just the most different
+    deck_recognisability: float = 0.3  # share of a card's value from review volume (well-known games)
 
 
-def taste(f: Features, library: dict[int, int], cfg: RecConfig) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Pick the liked and disliked games from a library ({appid: minutes})."""
-    played = pd.DataFrame({"appid": list(library), "minutes": list(library.values())})
+def normalize_library(lib: dict) -> dict[int, dict]:
+    """Libraries are {appid: {"minutes", "minutes_2weeks", "last_played"}}. Older saved files are
+    {appid: minutes}; those load with no recency information (treated as not played recently)."""
+    out = {}
+    for appid, v in lib.items():
+        v = v if isinstance(v, dict) else {"minutes": v}
+        out[int(appid)] = {"minutes": int(v.get("minutes", 0)),
+                           "minutes_2weeks": int(v.get("minutes_2weeks", 0)),
+                           "last_played": int(v.get("last_played", 0))}
+    return out
+
+
+def minutes(library: dict[int, dict]) -> dict[int, int]:
+    return {a: v["minutes"] for a, v in library.items()}
+
+
+def recency_factor(last_played: np.ndarray, cfg: RecConfig, now: float | None = None) -> np.ndarray:
+    """1.0 for a game played today, halving every recency_half_life_days, never below
+    recency_floor (so an old favourite still counts for something). Unknown dates get the floor."""
+    if not cfg.recency_half_life_days:
+        return np.ones(len(last_played))
+    now = now or time.time()
+    age_days = np.where(last_played > 0, (now - last_played) / 86400, np.inf)
+    decay = 0.5 ** (np.maximum(age_days, 0) / cfg.recency_half_life_days)
+    return cfg.recency_floor + (1 - cfg.recency_floor) * decay
+
+
+def taste(f: Features, library: dict[int, dict], cfg: RecConfig) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Pick the liked and disliked games from a library."""
+    library = normalize_library(library)
+    played = pd.DataFrame([{"appid": a, **v} for a, v in library.items()],
+                          columns=["appid", "minutes", "minutes_2weeks", "last_played"])
     played = played[played.minutes > 0]
     played = played[played.appid.isin(f.row_of.keys())]
     played["row"] = played.appid.map(f.row_of)
@@ -68,13 +108,18 @@ def taste(f: Features, library: dict[int, int], cfg: RecConfig) -> tuple[pd.Data
         played["measure"] = played.minutes / np.where(np.isnan(median), typical, np.maximum(median, 30))
     else:
         played["measure"] = played.minutes.astype(float)
+    # Recency: what someone plays now says more about what they want next than what they played
+    # years ago. Total playtime fades with time since last played; the last two weeks add a boost.
+    played["measure"] = (played.measure * recency_factor(played.last_played.to_numpy(), cfg)
+                         + cfg.recent_2weeks_boost * played.minutes_2weeks)
 
     liked = played.nlargest(cfg.liked_count, "measure")
     rest = played.drop(liked.index)
     rest = rest[rest.minutes.between(cfg.min_disliked_minutes, cfg.max_disliked_minutes)]
+    rest = rest[rest.minutes_2weeks == 0]           # still being tried out: not a dislike (yet)
     disliked = rest.nsmallest(cfg.disliked_count, "measure")
-    for t in (liked, disliked):
-        t["weight"] = np.log1p(t.minutes / 60) + 0.1
+    liked["weight"] = np.log1p(liked.measure / 60) + 0.1      # recency-adjusted
+    disliked["weight"] = np.log1p(disliked.minutes / 60) + 0.1
     return liked, disliked
 
 
@@ -123,14 +168,29 @@ def exclusion_reasons(f: Features, owned: set[int], cfg: RecConfig) -> pd.Series
     return reason
 
 
-def recommend(f: Features, library: dict[int, int], cfg: RecConfig | None = None,
-              full: bool = False) -> pd.DataFrame:
-    """Top cfg.n games, or with full=True every recommendable game in final list order."""
-    cfg = cfg or RecConfig()
+def add_reactions(f: Features, liked: pd.DataFrame, disliked: pd.DataFrame,
+                  interested=(), not_interested=()) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Fold first-look swipes into the taste profile. 'Interested' counts like a typical liked game;
+    'not interested' counts as a strong dislike, since it's said outright rather than guessed from
+    low playtime."""
+    def rows_for(appids, weight):
+        r = f.rows(appids)
+        return pd.DataFrame({"appid": f.games.appid.iloc[r].to_numpy(), "row": r,
+                             "name": f.games.name.iloc[r].to_numpy(), "weight": weight})
+    liked = pd.concat([liked, rows_for(interested, liked.weight.median())], ignore_index=True)
+    strong = liked.weight.max()
+    disliked = pd.concat([disliked, rows_for(not_interested, strong)], ignore_index=True)
+    return liked, disliked
+
+
+def score_candidates(f: Features, library: dict[int, int], cfg: RecConfig,
+                     interested=(), not_interested=()) -> pd.DataFrame:
+    """Every recommendable game with its score, best first (no list-shaping caps yet)."""
     liked, disliked = taste(f, library, cfg)
     if liked.empty:
         raise ValueError("None of this library's played games are in the catalog.")
-    reasons = exclusion_reasons(f, set(library), cfg)
+    liked, disliked = add_reactions(f, liked, disliked, interested, not_interested)
+    reasons = exclusion_reasons(f, set(library) | set(not_interested), cfg)
     rows = np.flatnonzero(reasons.eq("").to_numpy())
 
     like, best = similarity(f, rows, liked, cfg)
@@ -154,8 +214,11 @@ def recommend(f: Features, library: dict[int, int], cfg: RecConfig | None = None
         to_base = out[is_exp].assign(base=g.base_appid.to_numpy()[is_exp]).groupby("base").score.max()
         out = out[~is_exp]
         out["score"] = np.fmax(out.score, out.appid.map(to_base).to_numpy())
-    out = out.sort_values("score", ascending=False, ignore_index=True)
+    return out.sort_values("score", ascending=False, ignore_index=True)
 
+
+def arrange(out: pd.DataFrame, f: Features, library: dict[int, int], cfg: RecConfig) -> pd.DataFrame:
+    """Shape scored games into list order: family cap, variety round-robin, franchise cap."""
     # Family cap: keep the best-scoring editions/sequels of each game.
     out = out[out.groupby("family_id").cumcount() < cfg.max_per_family]
     # Variety: round-robin across the liked games each pick resembles.
@@ -169,14 +232,75 @@ def recommend(f: Features, library: dict[int, int], cfg: RecConfig | None = None
     kept = out[~over]
     out = pd.concat([kept.iloc[:cfg.n], pd.concat([kept.iloc[cfg.n:], out[over]]).sort_index()],
                     ignore_index=True)
-    out = out.drop(columns="_round").assign(rank=np.arange(1, len(out) + 1))
+    return out.drop(columns="_round").assign(rank=np.arange(1, len(out) + 1))
+
+
+def recommend(f: Features, library: dict[int, int], cfg: RecConfig | None = None,
+              full: bool = False) -> pd.DataFrame:
+    """Top cfg.n games, or with full=True every recommendable game in final list order."""
+    cfg = cfg or RecConfig()
+    out = arrange(score_candidates(f, library, cfg), f, library, cfg)
     return out if full else out.head(cfg.n)
 
 
-def get_library(user: str | None, path: Path | None, save: bool = True) -> dict[int, int]:
+# ---- First look: a 5-card deck, then a refined list -------------------------------------------
+
+
+def first_look(f: Features, library: dict[int, int], cfg: RecConfig | None = None):
+    """Returns (pool, deck). pool: the top cfg.pool_size recommendations, in list order (its first
+    cfg.n are the unrefined top list). deck: cfg.deck_size games from the pool that together show
+    the range of the user's taste.
+
+    Cards are picked by maximal marginal relevance: each next card is the best balance of 'strong
+    match' and 'unlike the cards already picked'. Cards only come from the pool, so variety is
+    never forced: a library of nothing but shooters gets five different kinds of shooter, not a
+    farming sim. Recognisable games are slightly preferred, since a card is only useful if the
+    player can judge the game at a glance."""
+    cfg = cfg or RecConfig()
+    pool = recommend(f, library, cfg, full=True).head(cfg.pool_size).reset_index(drop=True)
+    s = pool.score.to_numpy()
+    rel = (s - s.min()) / ((s.max() - s.min()) or 1)
+    rows = np.array(f.rows(pool.appid))
+    volume = f.games.log_reviews.iloc[rows].to_numpy()
+    volume = volume / (volume.max() or 1)
+    value = (1 - cfg.deck_recognisability) * rel + cfg.deck_recognisability * volume
+    sims = (f.X[rows] @ f.X[rows].T).toarray()
+
+    picked: list[int] = []
+    for _ in range(min(cfg.deck_size, len(pool))):
+        overlap = sims[:, picked].max(axis=1) if picked else np.zeros(len(pool))
+        mmr = cfg.deck_relevance * value - (1 - cfg.deck_relevance) * overlap
+        mmr[picked] = -np.inf
+        picked.append(int(mmr.argmax()))
+    return pool, pool.iloc[picked].reset_index(drop=True)
+
+
+def refine(f: Features, library: dict[int, int], pool: pd.DataFrame, deck: pd.DataFrame,
+           reactions: dict[int, bool], cfg: RecConfig | None = None) -> pd.DataFrame:
+    """The final list after the first look. reactions: {appid: True (interested) / False}.
+
+    - The list is re-scored with the swipes folded into the taste profile, from the pool only.
+    - 'Not interested' cards never appear.
+    - A card appears only if it was already in the unrefined top list; if it was and the user
+      swiped it up, it is guaranteed a place."""
+    cfg = cfg or RecConfig()
+    interested = [a for a, yes in reactions.items() if yes]
+    not_interested = [a for a, yes in reactions.items() if not yes]
+    original_top = set(pool.appid.head(cfg.n))
+    blocked = (set(deck.appid) - original_top) | set(not_interested)
+    allowed = set(pool.appid) - blocked
+
+    scored = score_candidates(f, library, cfg, interested, not_interested)
+    ranked = arrange(scored[scored.appid.isin(allowed)].reset_index(drop=True), f, library, cfg)
+    pinned = ranked.appid.isin(set(interested) & original_top)
+    final = pd.concat([ranked[pinned], ranked[~pinned].head(cfg.n - int(pinned.sum()))])
+    return final.sort_values("rank").reset_index(drop=True).assign(rank=lambda d: range(1, len(d) + 1))
+
+
+def get_library(user: str | None, path: Path | None, save: bool = True) -> dict[int, dict]:
     """Load a saved library, or fetch it from Steam and save a copy to libraries/."""
     if path:
-        return {int(k): int(v) for k, v in json.loads(path.read_text(encoding="utf-8")).items()}
+        return normalize_library(json.loads(path.read_text(encoding="utf-8")))
     from steam_api import owned_games, resolve_steamid
     steamid = resolve_steamid(user)
     lib = owned_games(steamid)

@@ -55,12 +55,17 @@ def resolve_steamid(user: str) -> str:
     return data["steamid"]
 
 
-def owned_games(user: str) -> dict[int, int]:
-    """{appid: minutes played} for every game the user owns, including unplayed (0) ones."""
+def owned_games(user: str) -> dict[int, dict]:
+    """Every game the user owns, including unplayed ones:
+    {appid: {"minutes": total, "minutes_2weeks": last two weeks, "last_played": unix time or 0}}.
+    Steam keeps no longer playtime history than the two-week figure."""
     steamid = resolve_steamid(user)
     data = _get("IPlayerService/GetOwnedGames/v1", steamid=steamid,
                 include_played_free_games=1, include_appinfo=0)["response"]
     games = data.get("games")
     if not games:
         raise ValueError("Steam returned no games. Is the profile's 'Game details' setting Public?")
-    return {int(g["appid"]): int(g.get("playtime_forever", 0)) for g in games}
+    return {int(g["appid"]): {"minutes": int(g.get("playtime_forever", 0)),
+                              "minutes_2weeks": int(g.get("playtime_2weeks", 0)),
+                              "last_played": int(g.get("rtime_last_played", 0))}
+            for g in games}
