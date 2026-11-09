@@ -36,6 +36,9 @@ CSS = """
 .card .body { padding: 14px 18px 16px; }
 .card h2 { margin: 0 0 4px; font-size: 1.5rem; }
 .card .meta { color: var(--muted); font-size: .9rem; margin-bottom: 10px; }
+.card h2 a { color: inherit; text-decoration: none; }
+.card h2 a:hover { text-decoration: underline; }
+.card a.store { display: inline-block; margin-top: 8px; font-size: .85rem; }
 .card .why { font-size: .95rem; margin-top: 10px; }
 .chip { display: inline-block; background: var(--chip); border-radius: 999px; padding: 2px 10px;
         margin: 0 6px 6px 0; font-size: .8rem; }
@@ -275,9 +278,10 @@ elif stage == "deck":
       <div class="card" id="card-{i}">
         <img src="{html.escape(str(g.header_image))}" alt="">
         <div class="body">
-          <h2>{html.escape(g['name'])}</h2>
+          <h2><a href="{STORE.format(int(card.appid))}" target="_blank">{html.escape(g['name'])}</a></h2>
           <div class="meta">{html.escape(meta_line(g))}</div>
           {chips}
+          <div><a class="store" href="{STORE.format(int(card.appid))}" target="_blank">View on Steam ↗</a></div>
         </div>
       </div>""")
     up, down = st.columns(2)
