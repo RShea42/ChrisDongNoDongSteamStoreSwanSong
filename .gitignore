@@ -7,3 +7,6 @@ __pycache__/
 artifacts/
 # Players' Steam libraries cached by recommend.py / litmus.py (personal data)
 libraries/
+
+# Teammate repo cloned locally (separate git repo; not part of this project)
+Peytons Stuff/
