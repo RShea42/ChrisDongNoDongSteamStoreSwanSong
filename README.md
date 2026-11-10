@@ -24,6 +24,24 @@ Give it a Steam profile; it reads the player's library and recommends 15 games f
 ### In progress
 - **Model comparison**: the group is comparing this model against two others.
 
+### Tuning notes (manual testing on the live app)
+- **Blind test, 30 hidden, no recency.** Hiding the 30 most-played games (test mode) with the
+  recency setting Off gave surprisingly solid results: 4 hidden games came back. Release date
+  seemed not to matter; Left 4 Dead 2 (2009) was the top recommendation.
+- **A settings combination that gave quality results** (Advanced settings; code defaults in brackets):
+
+  | Slider | Setting | Value | Default |
+  |---|---|---|---|
+  | Favor well-reviewed, popular games | `quality_weight` | 0 | 0.5 |
+  | Avoid games like the ones you barely played | `dislike_weight` | 1.5 (slider max) | 0.5 |
+  | Games that define your taste | `liked_count` | 15 | 15 |
+  | Max picks from series you own | `max_franchise_picks` | 3 | 3 |
+  | Variety (picks per liked game, per round) | `max_per_anchor` | 2 | 2 |
+  | Minimum Steam reviews | `min_reviews` | 10 (slider min) | 50 |
+
+  This contrasts with `tune.py`'s blind-test sweep, which favored `quality_weight` 0.5. Worth
+  checking with `tune.py`/`litmus.py` (e.g. `--hide 30`) before changing defaults.
+
 ### Not started / ideas for later
 1. **Fresh catalog data**: the known limitation, see below.
 2. **Group mode**: compare several libraries to find games everyone can play together (the

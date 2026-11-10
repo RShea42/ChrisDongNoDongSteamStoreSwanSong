@@ -70,7 +70,7 @@ details.why p { margin: 6px 0 0 1.1em; }
 DEFAULTS = RecConfig()
 # RecConfig setting -> (label, min, max, step, explanation) for the Advanced settings sliders.
 ADVANCED = {
-    "quality_weight": ("Favour well-reviewed, popular games", 0.0, 1.0, 0.05,
+    "quality_weight": ("Favor well-reviewed, popular games", 0.0, 1.0, 0.05,
                        "Share of each score from review score and review count. Higher = safer, "
                        "better-known picks; above ~0.6 lists turn generic."),
     "dislike_weight": ("Avoid games like the ones you barely played", 0.0, 1.5, 0.25,
@@ -278,7 +278,7 @@ with st.sidebar:
     st.header("Settings")
     hide_adult = st.toggle("Hide adult content", value=True)
     recency = st.select_slider(
-        "Favour recently played games", options=["Off", "3 months", "6 months", "1 year", "2 years"],
+        "Favor recently played games", options=["Off", "3 months", "6 months", "1 year", "2 years"],
         value="6 months", disabled=stage != "input",
         help="How fast old playtime fades: a game's hours count half after this long since you "
              "last played it (never less than a quarter). Hours in the last two weeks get a boost.")
@@ -391,7 +391,7 @@ elif stage == "results":
               <a href="{STORE.format(int(x.appid))}" target="_blank">{html.escape(g['name'])}</a>
               <div class="meta">{html.escape(meta_line(g, prices))}</div>
               {why_html(x, state.reactions, swiped_up)}
-              {'<div class="meta">🎯 <b>One of your hidden favourites (or its series)</b></div>'
+              {'<div class="meta">🎯 <b>One of your hidden favorites (or its series)</b></div>'
                if x.family_id in hidden_families else ''}
             </div>
           </div>""")
