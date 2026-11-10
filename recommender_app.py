@@ -103,12 +103,27 @@ def fetch_library(profile: str) -> dict[int, int]:
 
 
 @functools.lru_cache(maxsize=5000)     # server memory only; failures raise, so they aren't cached
-def _fetch_blurb(appid: int) -> str:
-    url = f"https://store.steampowered.com/api/appdetails?appids={appid}&l=english&cc=us&filters=basic"
+def _fetch_store(appid: int) -> tuple[str, str]:
+    """(blurb, price) from the live Steam store (US prices). Price is "" when the store page
+    exists but lists no price (delisted, unreleased, or only sold in a bundle)."""
+    url = (f"https://store.steampowered.com/api/appdetails?appids={appid}&l=english&cc=us"
+           "&filters=basic,price_overview")
     req = urllib.request.Request(url, headers={"User-Agent": "steam-recommender-class-project"})
     with urllib.request.urlopen(req, timeout=8) as resp:
         data = json.load(resp)[str(appid)]
-    text = data.get("data", {}).get("short_description", "") if data.get("success") else ""
+    info = data.get("data", {}) if data.get("success") else {}
+    return _blurb(info.get("short_description", "")), _price(info)
+
+
+def _price(info: dict) -> str:
+    po = info.get("price_overview")
+    if po:
+        off = po.get("discount_percent", 0)
+        return po["final_formatted"] + (f" ({off}% off)" if off else "")
+    return "Free" if info.get("is_free") else ""
+
+
+def _blurb(text: str) -> str:
     text = " ".join(re.sub(r"<[^>]+>", " ", htmllib.unescape(text)).split())
     # Keep it a quick read: whole sentences up to ~220 characters (always at least the first, and
     # a second if the first is under 80 characters and says little); if that runs very long, cut
@@ -123,14 +138,14 @@ def _fetch_blurb(appid: int) -> str:
     return kept
 
 
-def store_blurbs(appids) -> dict[int, str]:
-    """Steam's own one-or-two-sentence store description for each game, fetched in parallel.
-    A game whose fetch fails just gets no blurb."""
+def store_info(appids) -> dict[int, tuple[str, str]]:
+    """{appid: (blurb, price)} from the live store, fetched in parallel. A failed fetch gives
+    ("", None): no blurb, and the price falls back to the catalog's."""
     def one(appid):
         try:
-            return appid, _fetch_blurb(int(appid))
+            return int(appid), _fetch_store(int(appid))
         except Exception:
-            return appid, ""
+            return int(appid), ("", None)
     with ThreadPoolExecutor(max_workers=5) as pool:
         return dict(pool.map(one, appids))
 
@@ -140,8 +155,13 @@ def details(appid: int) -> pd.Series:
     return f.games.iloc[f.row_of[appid]]
 
 
-def meta_line(g: pd.Series) -> str:
-    price = "Free" if g.price == 0 else f"${g.price:.2f}"
+def meta_line(g: pd.Series, store: dict | None = None) -> str:
+    live = (store or {}).get(int(g.appid), ("", None))[1]
+    if live is None:                       # store unreachable: use the (possibly stale) catalog
+        live = "Free" if g.price == 0 else f"${g.price:.2f}"
+    # No store price: free-to-play conversions (e.g. Rocket League) aren't flagged is_free, but the
+    # catalog has them at 0; anything else is delisted, unreleased, or bundle-only.
+    price = live or ("Free" if g.price == 0 else "Price not listed")
     reviews = f"{g.positive_review_pct:.0f}% positive of {int(g.total_reviews):,} reviews"
     return f"{price} · {reviews} · {int(g.release_year)}"
 
@@ -180,7 +200,7 @@ def why_html(x: pd.Series, reactions: dict[int, bool] | None = None,
 
 def reset():
     for k in ("stage", "pool", "deck", "card", "reactions", "final", "error", "hidden",
-              "hidden_groups", "blurbs"):
+              "hidden_groups", "store"):
         st.session_state.pop(k, None)
 
 
@@ -224,7 +244,7 @@ def start(profile: str, cfg: RecConfig, hide_top: int = 0, hide_recent: int = 0)
         return
     st.session_state.update(stage="deck", library=library, pool=pool, deck=deck, card=0,
                             reactions={}, cfg=cfg, hidden=hidden, hidden_groups=groups,
-                            blurbs=store_blurbs(deck.appid.tolist()))
+                            store=store_info(deck.appid.tolist()))
 
 
 def react(card: int, interested: bool):
@@ -320,8 +340,8 @@ elif stage == "deck":
         <img src="{html.escape(str(g.header_image))}" alt="">
         <div class="body">
           <h2><a href="{STORE.format(int(card.appid))}" target="_blank">{html.escape(g['name'])}</a></h2>
-          <div class="meta">{html.escape(meta_line(g))}</div>
-          {f'<p class="blurb">{html.escape(blurb)}</p>' if (blurb := state.blurbs.get(int(card.appid))) else ''}
+          <div class="meta">{html.escape(meta_line(g, state.store))}</div>
+          {f'<p class="blurb">{html.escape(blurb)}</p>' if (blurb := state.store.get(int(card.appid), ("",))[0]) else ''}
           {chips}
           <div><a class="store" href="{STORE.format(int(card.appid))}" target="_blank">View on Steam ↗</a></div>
         </div>
@@ -360,6 +380,7 @@ elif stage == "results":
                 st.markdown(f"**{group.capitalize()}:** {', '.join(names)}{note}")
     rows = []
     swiped_up = {n for a, n in zip(state.deck.appid, state.deck.name) if state.reactions.get(int(a))}
+    prices = store_info(state.final.appid.tolist())     # cached per game, so reruns are instant
     for _, x in state.final.iterrows():
         g = details(int(x.appid))
         rows.append(f"""
@@ -368,7 +389,7 @@ elif stage == "results":
             <img src="{html.escape(str(g.header_image))}" alt="">
             <div>
               <a href="{STORE.format(int(x.appid))}" target="_blank">{html.escape(g['name'])}</a>
-              <div class="meta">{html.escape(meta_line(g))}</div>
+              <div class="meta">{html.escape(meta_line(g, prices))}</div>
               {why_html(x, state.reactions, swiped_up)}
               {'<div class="meta">🎯 <b>One of your hidden favourites (or its series)</b></div>'
                if x.family_id in hidden_families else ''}
